@@ -2,8 +2,7 @@ require 'test/unit'
 require 'base64'
 require 'png'
 
-class TestDecode < Test::Unit::TestCase
-
+class TestSimple < Test::Unit::TestCase
   TEST_DATA = Base64.decode64(<<~EOD)
     iVBORw0KGgoAAAANSUhEUgAAAQAAAADgBAMAAAAeb6VjAAAAIVBMVEV/f38AAL+r
     EwAAawAAAAC/v78AePj4OAAAqwD/o0f////z+X8QAAASJElEQVR4nMWdz4/bNhbH
@@ -129,5 +128,6 @@ class TestDecode < Test::Unit::TestCase
     dat = assert_nothing_raised {enc << img}
 
     assert_true(dat.bytesize < img.bytesize)
+    # IO.binwrite("output.png", dat)
   end
 end

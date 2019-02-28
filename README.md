@@ -58,6 +58,8 @@ IO.binwrite("test.png", enc << IO.binread("test.raw"))
 | :pixel_fromat | String or Symbol | alias of :color_type |
 | :interlace    | Boolean          | use interlace mode |
 | :compression  | Integer or String or Symbol | compression level |
+| :text         | Hash             | text information |
+| :time         | Boolean          | with tIME chunk |
 
 #### supported input color type
 GRAY GRASCALE GA RGB RGBA
