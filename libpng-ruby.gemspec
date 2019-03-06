@@ -12,6 +12,7 @@ Gem::Specification.new do |spec|
   spec.summary       = %q{libpng interface for ruby}
   spec.description   = %q{libpng interface for ruby}
   spec.homepage      = "https://github.com/kwgt/libpng-ruby"
+  spec.license       = "MIT"
 
   if spec.respond_to?(:metadata)
     spec.metadata["homepage_uri"] = spec.homepage
