@@ -13,6 +13,7 @@
 #include <string.h>
 #include <setjmp.h>
 #include <time.h>
+#include <math.h>
 
 #include <png.h>
 #include <zlib.h>
@@ -24,6 +25,10 @@
 #define RUNTIME_ERROR(msg)          rb_raise(rb_eRuntimeError, (msg))
 #define ARGUMENT_ERROR(msg)         rb_raise(rb_eArgError, (msg))
 #define TYPE_ERROR(msg)             rb_raise(rb_eTypeError, (msg))
+#define NOMEMORY_ERROR(msg)         rb_raise(rb_eNoMemError, (msg))
+
+#define API_SIMPLIFIED              1
+#define API_CLASSIC                 2
 
 #define EQ_STR(val,str)             (rb_to_id(val) == rb_intern(str))
 #define EQ_INT(val,n)               (FIX2INT(val) == n)
@@ -36,6 +41,7 @@ static VALUE meta_klass;
 static ID id_meta;
 static ID id_stride;
 static ID id_format;
+static ID id_pixfmt;
 static ID id_ncompo;
 
 typedef struct {
@@ -68,52 +74,85 @@ typedef struct {
 
   png_text* text;
   int num_text;
+
+  double gamma;
 } png_encoder_t;
 
-typedef struct {
-  /*
-   * for raw level chunk access
-   */
-	png_structp ctx;   // as 'context'
-	png_infop fsi;     // as 'front side infomation'
-	png_infop bsi;     // as 'back side infomation'
+typedef union {
+  struct {
+    int api_type;
+    int format;
+    int need_meta;
+    double display_gamma;
+  } common;
 
-  png_uint_32 width;
-  png_uint_32 height;
-  int depth;
-  int c_type;        // as 'color type'
-  int i_meth;        // as 'interlace method'
-  int c_meth;        // as 'compression method'
-  int f_meth;        // as 'filter method'
+  struct {
+    /*
+     * common field
+     */
+    int api_type;
+    int format;
+    int need_meta;
+    double display_gamma;
 
-  mem_io_t io;
+    /*
+     * classic api context
+     */
+    png_structp ctx;   // as 'context'
+    png_infop fsi;     // as 'front side infomation'
+    png_infop bsi;     // as 'back side infomation'
 
-  png_text* text;
-  int num_text;
-  png_time* time;
+    png_uint_32 width;
+    png_uint_32 height;
 
-  /*
-   * for Simplified API
-   */
-  int format;
-  int need_meta;
+    png_byte** rows;
+
+    int depth;
+    int c_type;        // as 'color type'
+    int i_meth;        // as 'interlace method'
+    int c_meth;        // as 'compression method'
+    int f_meth;        // as 'filter method'
+
+    mem_io_t io;
+
+    png_text* text;
+    int num_text;
+    png_time* time;
+    double file_gamma;
+  } classic;
+
+  struct {
+    /*
+     * common field
+     */
+    int api_type;
+    int format;
+    int need_meta;
+    double display_gamma;
+
+    /*
+     * simplified api context
+     */
+    png_image* ctx;
+  } simplified;
 } png_decoder_t;
 
 static const char* decoder_opt_keys[] ={
-  "color_type",      // string (default: "RGB")
   "pixel_format",    // alias of "color_type"
   "without_meta",    // bool (default: false)
+  "api_type",        // string ("simplified" or "classic")
+  "display_gamma",   // float
 };
 
 static ID decoder_opt_ids[N(decoder_opt_keys)];
 
 static const char* encoder_opt_keys[] ={
-  "color_type",      // string (default: "RGB")
   "pixel_format",    // alias of "color_type"
   "interlace",       // bool (default: false)
   "compression",     // int 0~9 
   "text",            // hash<String,String>
   "time",            // bool (default: true)
+  "gamma",           // float
 };
 
 static ID encoder_opt_ids[N(encoder_opt_keys)];
@@ -156,7 +195,7 @@ mem_io_write_data(png_structp ctx, png_bytep src, png_size_t size)
   VALUE buf;
 
   buf = (VALUE)png_get_io_ptr(ctx);
-  rb_str_buf_cat(buf, src, size);
+  rb_str_buf_cat(buf, (const char *)src, size);
 }
 
 static void
@@ -178,8 +217,8 @@ rb_encoder_alloc(VALUE self)
   ptr->c_level   = Z_DEFAULT_COMPRESSION;
   ptr->f_type    = PNG_FILTER_TYPE_BASE;
   ptr->num_comp  = 3;
-
   ptr->with_time = !0;
+  ptr->gamma     = NAN;
 
   return Data_Wrap_Struct(encoder_klass, 0, rb_encoder_free, ptr);
 }
@@ -356,6 +395,13 @@ eval_encoder_opt_time(png_encoder_t* ptr, VALUE opt)
   }
 }
 
+static void
+eval_encoder_opt_gamma(png_encoder_t* ptr, VALUE opt)
+{
+  if (opt != Qundef) {
+    ptr->gamma = NUM2DBL(opt);
+  }
+}
 
 static void
 set_encoder_context(png_encoder_t* ptr, int wd, int ht, VALUE opt)
@@ -364,10 +410,8 @@ set_encoder_context(png_encoder_t* ptr, int wd, int ht, VALUE opt)
   png_infop info;
   VALUE opts[N(encoder_opt_ids)];
 
-  char* err;
-  int stride;
+  const char* err;
   png_byte** rows;
-  int row_sz;
 
   /*
    * parse options
@@ -377,20 +421,20 @@ set_encoder_context(png_encoder_t* ptr, int wd, int ht, VALUE opt)
   /*
    * set context
    */
-  eval_encoder_opt_color_type(ptr, (opts[0] != Qundef)? opts[0]: opts[1]);
-  eval_encoder_opt_interlace(ptr, opts[2]);
-  eval_encoder_opt_compression(ptr, opts[3]);
-  eval_encoder_opt_text(ptr, opts[4]);
-  eval_encoder_opt_time(ptr, opts[5]);
+  eval_encoder_opt_color_type(ptr, opts[0]);
+  eval_encoder_opt_interlace(ptr, opts[1]);
+  eval_encoder_opt_compression(ptr, opts[2]);
+  eval_encoder_opt_text(ptr, opts[3]);
+  eval_encoder_opt_time(ptr, opts[4]);
+  eval_encoder_opt_gamma(ptr, opts[5]);
 
   /*
    * create PNG context
    */
   do {
-    err    = NULL;
-    rows   = NULL;
-    info   = NULL;
-    row_sz = wd * ptr->num_comp;
+    err  = NULL;
+    rows = NULL;
+    info = NULL;
 
     ctx = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (ctx == NULL) {
@@ -463,6 +507,8 @@ rb_encoder_initialize(int argc, VALUE* argv, VALUE self)
    * set context
    */
   set_encoder_context(ptr, FIX2INT(wd), FIX2INT(ht), opts);
+
+  return self;
 }
 
 static VALUE
@@ -470,14 +516,12 @@ rb_encoder_encode(VALUE self, VALUE data)
 {
   VALUE ret;
   png_encoder_t* ptr;
-  char* err;
-  int i;
+  png_uint_32 i;
   uint8_t* p;
 
   /*
    * initialize
    */
-  err = NULL;
   ret = rb_str_buf_new(0);
 
   /*
@@ -519,6 +563,10 @@ rb_encoder_encode(VALUE self, VALUE data)
     png_set_tIME(ptr->ctx, ptr->info, &png_time);
   }
 
+  if (!isnan(ptr->gamma)) {
+    png_set_gAMA(ptr->ctx, ptr->info, ptr->gamma);
+  }
+
   png_set_compression_level(ptr->ctx, ptr->c_level);
 
   png_set_write_fn(ptr->ctx,
@@ -526,21 +574,19 @@ rb_encoder_encode(VALUE self, VALUE data)
                    (png_rw_ptr)mem_io_write_data,
                    (png_flush_ptr)mem_io_flush);
 
-  for (i = 0, p = RSTRING_PTR(data); i < ptr->height; i++, p += ptr->stride) {
+  p = (png_byte*)RSTRING_PTR(data);
+  for (i = 0; i < ptr->height; i++) {
     ptr->rows[i] = p;
+    p += ptr->stride;
   }
 
   png_set_rows(ptr->ctx, ptr->info, ptr->rows);
 
   if (setjmp(png_jmpbuf(ptr->ctx))) {
-    err = "encode error";
+    RUNTIME_ERROR("encode error");
 
   } else {
     png_write_png(ptr->ctx, ptr->info, PNG_TRANSFORM_IDENTITY, NULL);
-  }
-
-  if (err) {
-    RUNTIME_ERROR(err);
   }
 
   return ret;
@@ -556,6 +602,7 @@ mem_io_read_data(png_structp ctx, png_bytep dst, png_size_t rq_size)
   if (io->pos + rq_size <= io->size) {
     memcpy(dst, io->ptr + io->pos, rq_size);
     io->pos += rq_size;
+
   } else {
     png_error(ctx, "data not enough.");
   }
@@ -569,8 +616,22 @@ rb_decoder_free(void* _ptr)
 
   ptr = (png_decoder_t*)_ptr;
 
-  if (ptr->ctx != NULL) {
-    png_destroy_read_struct(&ptr->ctx, &ptr->fsi, &ptr->bsi);
+  if (ptr->common.api_type == API_SIMPLIFIED) {
+    if (ptr->simplified.ctx) {
+      png_image_free(ptr->simplified.ctx);
+      xfree(ptr->simplified.ctx);
+    }
+
+  } else {
+   if (ptr->classic.ctx != NULL) {
+      if (ptr->classic.rows != NULL) {
+        png_free(ptr->classic.ctx, ptr->classic.rows);
+      }
+
+      png_destroy_read_struct(&ptr->classic.ctx,
+                              &ptr->classic.fsi,
+                              &ptr->classic.bsi);
+    }
   }
 
   free(ptr);
@@ -584,46 +645,72 @@ rb_decoder_alloc(VALUE self)
   ptr = ALLOC(png_decoder_t);
   memset(ptr, 0, sizeof(*ptr));
 
-  ptr->format    = PNG_FORMAT_RGB;
-  ptr->need_meta = !0;
+  ptr->common.api_type      = API_SIMPLIFIED;
+  ptr->common.format        = PNG_FORMAT_RGB;
+  ptr->common.need_meta     = !0;
+  ptr->common.display_gamma = NAN;
 
   return Data_Wrap_Struct(decoder_klass, 0, rb_decoder_free, ptr);
 }
 
 static void
-eval_decoder_opt_color_type(png_decoder_t* ptr, VALUE opt)
+eval_decoder_opt_api_type(png_decoder_t* ptr, VALUE opt)
 {
+  int api_type;
+
+  if (opt != Qundef) {
+    if (EQ_STR(opt, "simplified")) {
+      api_type = API_SIMPLIFIED;
+
+    } else if (EQ_STR(opt, "classic")) {
+      api_type = API_CLASSIC;
+
+    } else {
+      ARGUMENT_ERROR(":api_type is invalid value");
+    }
+
+    ptr->common.api_type = api_type;
+  }
+}
+
+static void
+eval_decoder_opt_pixel_format(png_decoder_t* ptr, VALUE opt)
+{
+  int format;
+
   if (opt != Qundef) {
     if (EQ_STR(opt, "GRAY") || EQ_STR(opt, "GRAYSCALE")) {
-      ptr->format = PNG_FORMAT_GRAY;
+      format = PNG_FORMAT_GRAY;
 
     } else if (EQ_STR(opt, "GA")) {
-      ptr->format = PNG_FORMAT_GA;
+      format = PNG_FORMAT_GA;
 
     } else if (EQ_STR(opt, "AG")) {
-      ptr->format = PNG_FORMAT_AG;
+      format = PNG_FORMAT_AG;
 
     } else if (EQ_STR(opt, "RGB")) {
-      ptr->format = PNG_FORMAT_RGB;
+      format = PNG_FORMAT_RGB;
 
     } else if (EQ_STR(opt, "BGR")) {
-      ptr->format = PNG_FORMAT_BGR;
+      format = PNG_FORMAT_BGR;
 
     } else if (EQ_STR(opt, "RGBA")) {
-      ptr->format = PNG_FORMAT_RGBA;
+      format = PNG_FORMAT_RGBA;
 
     } else if (EQ_STR(opt, "ARGB")) {
-      ptr->format = PNG_FORMAT_ARGB;
+      format = PNG_FORMAT_ARGB;
 
     } else if (EQ_STR(opt, "BGRA")) {
-      ptr->format = PNG_FORMAT_BGRA;
+      format = PNG_FORMAT_BGRA;
 
     } else if (EQ_STR(opt, "ABGR")) {
-      ptr->format = PNG_FORMAT_ABGR;
+      format = PNG_FORMAT_ABGR;
 
     } else {
       ARGUMENT_ERROR(":color_type is invalid value");
     }
+
+    ptr->common.format = format;
   }
 }
 
@@ -631,10 +718,17 @@ static void
 eval_decoder_opt_without_meta(png_decoder_t* ptr, VALUE opt)
 {
   if (opt != Qundef) {
-    ptr->need_meta = !RTEST(opt);
+    ptr->common.need_meta = !RTEST(opt);
   }
 }
 
+static void
+eval_decoder_opt_display_gamma(png_decoder_t* ptr, VALUE opt)
+{
+  if (opt != Qundef) {
+    ptr->common.display_gamma = NUM2DBL(opt);
+  }
+}
 
 static void
 set_decoder_context(png_decoder_t* ptr, VALUE opt)
@@ -649,8 +743,10 @@ set_decoder_context(png_decoder_t* ptr, VALUE opt)
   /*
    * set context
    */
-  eval_decoder_opt_color_type(ptr, (opts[0] != Qundef)? opts[0]: opts[1]);
-  eval_decoder_opt_without_meta(ptr, opts[2]);
+  eval_decoder_opt_api_type(ptr, opts[2]);
+  eval_decoder_opt_pixel_format(ptr, opts[0]);
+  eval_decoder_opt_without_meta(ptr, opts[1]);
+  eval_decoder_opt_display_gamma(ptr, opts[3]);
 }
 
 static VALUE
@@ -679,13 +775,13 @@ rb_decoder_initialize(int argc, VALUE* argv, VALUE self)
 }
 
 static void
-set_read_context(png_decoder_t* ptr, VALUE dat)
+set_read_context(png_decoder_t* ptr, VALUE data)
 {
   png_structp ctx;
   png_infop fsi;
   png_infop bsi;
 
-  char* err;
+  const char* err;
 
   do {
     err = NULL;
@@ -705,20 +801,20 @@ set_read_context(png_decoder_t* ptr, VALUE dat)
       break;
     }
 
-    ptr->ctx     = ctx;
-    ptr->fsi     = fsi;
-    ptr->bsi     = bsi;
+    ptr->classic.ctx     = ctx;
+    ptr->classic.fsi     = fsi;
+    ptr->classic.bsi     = bsi;
 
-    ptr->io.ptr  = RSTRING_PTR(dat);
-    ptr->io.size = RSTRING_LEN(dat);
-    ptr->io.pos  = 0;
+    ptr->classic.io.ptr  = (uint8_t*)RSTRING_PTR(data);
+    ptr->classic.io.size = RSTRING_LEN(data);
+    ptr->classic.io.pos  = 0;
 
-    if (setjmp(png_jmpbuf(ptr->ctx))) {
-      err = "decode error";
+    if (setjmp(png_jmpbuf(ptr->classic.ctx))) {
+      RUNTIME_ERROR("decode error");
 
     } else {
-      png_set_read_fn(ptr->ctx,
-                      (png_voidp)&ptr->io,
+      png_set_read_fn(ptr->classic.ctx,
+                      (png_voidp)&ptr->classic.io,
                       (png_rw_ptr)mem_io_read_data);
     }
   } while(0);
@@ -733,33 +829,40 @@ set_read_context(png_decoder_t* ptr, VALUE dat)
 }
 
 static void
-read_header(png_decoder_t* ptr)
+get_header_info(png_decoder_t* ptr)
 {
-  png_read_info(ptr->ctx, ptr->fsi);
+  png_get_IHDR(ptr->classic.ctx,
+               ptr->classic.fsi,
+               &ptr->classic.width,
+               &ptr->classic.height,
+               &ptr->classic.depth,
+               &ptr->classic.c_type,
+               &ptr->classic.i_meth,
+               &ptr->classic.c_meth,
+               &ptr->classic.f_meth); 
 
-  png_get_IHDR(ptr->ctx,
-               ptr->fsi,
-               &ptr->width,
-               &ptr->height,
-               &ptr->depth,
-               &ptr->c_type,
-               &ptr->i_meth,
-               &ptr->c_meth,
-               &ptr->f_meth); 
+  png_get_tIME(ptr->classic.ctx, ptr->classic.fsi, &ptr->classic.time);
 
-  png_get_tIME(ptr->ctx, ptr->fsi, &ptr->time);
-  png_get_text(ptr->ctx, ptr->fsi, &ptr->text, &ptr->num_text);
+  png_get_text(ptr->classic.ctx,
+               ptr->classic.fsi,
+               &ptr->classic.text,
+               &ptr->classic.num_text);
+
+  if (!png_get_gAMA(ptr->classic.ctx,
+                    ptr->classic.fsi, &ptr->classic.file_gamma)) {
+    ptr->classic.file_gamma = NAN;
+  }
 }
 
 static VALUE
 get_color_type_str(png_decoder_t* ptr)
 {
-  char* cstr;
+  const char* cstr;
   char tmp[32];
 
-  switch (ptr->c_type) {
+  switch (ptr->classic.c_type) {
   case PNG_COLOR_TYPE_GRAY:
-    cstr = "GRAYSCALE";
+    cstr = "GRAY";
     break;
 
   case PNG_COLOR_TYPE_PALETTE:
@@ -779,7 +882,7 @@ get_color_type_str(png_decoder_t* ptr)
     break;
 
   default:
-    sprintf(tmp, "UNKNOWN(%d)", ptr->c_type);
+    sprintf(tmp, "UNKNOWN(%d)", ptr->classic.c_type);
     cstr = tmp;
     break;
   }
@@ -790,10 +893,10 @@ get_color_type_str(png_decoder_t* ptr)
 static VALUE
 get_interlace_method_str(png_decoder_t* ptr)
 {
-  char* cstr;
+  const char* cstr;
   char tmp[32];
 
-  switch (ptr->i_meth) {
+  switch (ptr->classic.i_meth) {
   case PNG_INTERLACE_NONE:
     cstr = "NONE";
     break;
@@ -803,7 +906,7 @@ get_interlace_method_str(png_decoder_t* ptr)
     break;
 
   default:
-    sprintf(tmp, "UNKNOWN(%d)", ptr->i_meth);
+    sprintf(tmp, "UNKNOWN(%d)", ptr->classic.i_meth);
     cstr = tmp;
     break;
   }
@@ -814,16 +917,16 @@ get_interlace_method_str(png_decoder_t* ptr)
 static VALUE
 get_compression_method_str(png_decoder_t* ptr)
 {
-  char* cstr;
+  const char* cstr;
   char tmp[32];
 
-  switch (ptr->c_meth) {
+  switch (ptr->classic.c_meth) {
   case PNG_COMPRESSION_TYPE_BASE:
     cstr = "BASE";
     break;
 
   default:
-    sprintf(tmp, "UNKNOWN(%d)", ptr->c_meth);
+    sprintf(tmp, "UNKNOWN(%d)", ptr->classic.c_meth);
     cstr = tmp;
     break;
   }
@@ -834,10 +937,10 @@ get_compression_method_str(png_decoder_t* ptr)
 static VALUE
 get_filter_method_str(png_decoder_t* ptr)
 {
-  char* cstr;
+  const char* cstr;
   char tmp[32];
 
-  switch (ptr->f_meth) {
+  switch (ptr->classic.f_meth) {
   case PNG_FILTER_TYPE_BASE:
     cstr = "BASE";
     break;
@@ -847,7 +950,7 @@ get_filter_method_str(png_decoder_t* ptr)
     break;
 
   default:
-    sprintf(tmp, "UNKNOWN(%d)", ptr->f_meth);
+    sprintf(tmp, "UNKNOWN(%d)", ptr->classic.f_meth);
     cstr = tmp;
     break;
   }
@@ -866,9 +969,10 @@ create_text_meta(png_decoder_t* ptr)
 
   ret = rb_hash_new();
 
-  for (i = 0; i < ptr->num_text; i++) {
-    key = rb_str_new2(ptr->text[i].key);
-    val = rb_str_new(ptr->text[i].text, ptr->text[i].text_length);
+  for (i = 0; i < ptr->classic.num_text; i++) {
+    key = rb_str_new2(ptr->classic.text[i].key);
+    val = rb_str_new(ptr->classic.text[i].text,
+                     ptr->classic.text[i].text_length);
 
     rb_funcall(key, rb_intern("downcase!"), 0);
     rb_funcall(key, rb_intern("gsub!"), 2, rb_str_new2(" "), rb_str_new2("_"));
@@ -887,12 +991,12 @@ create_time_meta(png_decoder_t* ptr)
   ret = rb_funcall(rb_cTime,
                    rb_intern("utc"),
                    6,
-                   INT2FIX(ptr->time->year),
-                   INT2FIX(ptr->time->month),
-                   INT2FIX(ptr->time->day),
-                   INT2FIX(ptr->time->hour),
-                   INT2FIX(ptr->time->minute),
-                   INT2FIX(ptr->time->second));
+                   INT2FIX(ptr->classic.time->year),
+                   INT2FIX(ptr->classic.time->month),
+                   INT2FIX(ptr->classic.time->day),
+                   INT2FIX(ptr->classic.time->hour),
+                   INT2FIX(ptr->classic.time->minute),
+                   INT2FIX(ptr->classic.time->second));
 
   rb_funcall(ret, rb_intern("localtime"), 0);
 
@@ -904,13 +1008,11 @@ create_meta(png_decoder_t* ptr)
 {
   VALUE ret;
 
-  read_header(ptr);
-
   ret = rb_obj_alloc(meta_klass);
 
-  rb_ivar_set(ret, rb_intern("@width"), INT2FIX(ptr->width));
-  rb_ivar_set(ret, rb_intern("@height"), INT2FIX(ptr->height));
-  rb_ivar_set(ret, rb_intern("@bit_depth"), INT2FIX(ptr->depth));
+  rb_ivar_set(ret, rb_intern("@width"), INT2FIX(ptr->classic.width));
+  rb_ivar_set(ret, rb_intern("@height"), INT2FIX(ptr->classic.height));
+  rb_ivar_set(ret, rb_intern("@bit_depth"), INT2FIX(ptr->classic.depth));
   rb_ivar_set(ret, rb_intern("@color_type"), get_color_type_str(ptr));
 
   rb_ivar_set(ret, rb_intern("@interlace_method"),
@@ -921,31 +1023,42 @@ create_meta(png_decoder_t* ptr)
 
   rb_ivar_set(ret, rb_intern("@filter_method"), get_filter_method_str(ptr));
 
-  if (ptr->text) {
+  if (ptr->classic.text) {
     rb_ivar_set(ret, rb_intern("@text"), create_text_meta(ptr));
   }
 
-  if (ptr->time) {
+  if (ptr->classic.time) {
     rb_ivar_set(ret, rb_intern("@time"), create_time_meta(ptr));
+  }
+
+  if (!isnan(ptr->classic.file_gamma)) {
+    rb_ivar_set(ret,
+                rb_intern("@file_gamma"),
+                DBL2NUM(ptr->classic.file_gamma));
   }
 
   return ret;
 }
 
 static VALUE
-create_tiny_meta(png_imagep png)
+create_tiny_meta(png_decoder_t* ptr)
 {
   VALUE ret;
-  char* fmt;
+  const char* fmt;
   int nc;
 
   ret = rb_obj_alloc(meta_klass);
 
-  rb_ivar_set(ret, rb_intern("@width"), INT2FIX(png->width));
-  rb_ivar_set(ret, id_stride, INT2FIX(PNG_IMAGE_ROW_STRIDE(*png)));
-  rb_ivar_set(ret, rb_intern("@height"), INT2FIX(png->height));
+  rb_ivar_set(ret, rb_intern("@width"),
+              INT2FIX(ptr->simplified.ctx->width));
 
-  switch (png->format) {
+  rb_ivar_set(ret, id_stride,
+              INT2FIX(PNG_IMAGE_ROW_STRIDE(*ptr->simplified.ctx)));
+
+  rb_ivar_set(ret, rb_intern("@height"),
+              INT2FIX(ptr->simplified.ctx->height));
+
+  switch (ptr->common.format) {
   case PNG_FORMAT_GRAY:
     fmt = "GRAY";
     nc  = 1;
@@ -997,7 +1110,7 @@ create_tiny_meta(png_imagep png)
     break;
   }
 
-  rb_ivar_set(ret, rb_intern("@color_type"), rb_str_new_cstr(fmt));
+  rb_ivar_set(ret, id_pixfmt, rb_str_new_cstr(fmt));
   rb_ivar_set(ret, id_ncompo, INT2FIX(nc));
 
   return ret;
@@ -1006,13 +1119,63 @@ create_tiny_meta(png_imagep png)
 static void
 clear_read_context(png_decoder_t* ptr)
 {
-  if (ptr->ctx != NULL) {
-    png_destroy_read_struct(&ptr->ctx, &ptr->fsi, &ptr->bsi);
+  if (ptr->classic.ctx != NULL) {
+    png_destroy_read_struct(&ptr->classic.ctx,
+                            &ptr->classic.fsi,
+                            &ptr->classic.bsi);
+
+    ptr->classic.ctx  = NULL;
+    ptr->classic.fsi  = NULL;
+    ptr->classic.bsi  = NULL;
+
+    ptr->classic.text = NULL;
+    ptr->classic.time = NULL;
   }
 
-  ptr->io.ptr  = NULL;
-  ptr->io.size = 0;
-  ptr->io.pos  = 0;
+  ptr->classic.io.ptr  = NULL;
+  ptr->classic.io.size = 0;
+  ptr->classic.io.pos  = 0;
+}
+
+typedef struct {
+  png_decoder_t* ptr;
+  VALUE data;
+} read_header_arg_t ;
+
+static VALUE
+read_header_body(VALUE _arg)
+{
+  read_header_arg_t* arg;
+  png_decoder_t* ptr;
+  VALUE data;
+
+  /*
+   * initialize
+   */
+  arg  = (read_header_arg_t*)_arg;
+  ptr  = arg->ptr;
+  data = arg->data;
+
+  /*
+   * set context
+   */
+  set_read_context(ptr, data);
+
+  /*
+   * read header
+   */
+  png_read_info(ptr->classic.ctx, ptr->classic.fsi);
+  get_header_info(ptr);
+
+  return create_meta(ptr);
+}
+
+static VALUE
+read_header_ensure(VALUE _arg)
+{
+  clear_read_context((png_decoder_t*)_arg);
+
+  return Qundef;
 }
 
 static VALUE
@@ -1020,6 +1183,7 @@ rb_decoder_read_header(VALUE self, VALUE data)
 {
   VALUE ret;
   png_decoder_t* ptr;
+  read_header_arg_t arg;
 
   /*
    * argument check
@@ -1030,7 +1194,7 @@ rb_decoder_read_header(VALUE self, VALUE data)
     RUNTIME_ERROR("data too short.");
   }
 
-  if (png_sig_cmp(RSTRING_PTR(data), 0, 8)) {
+  if (png_sig_cmp((png_const_bytep)RSTRING_PTR(data), 0, 8)) {
     RUNTIME_ERROR("Invalid PNG signature.");
   }
 
@@ -1040,19 +1204,13 @@ rb_decoder_read_header(VALUE self, VALUE data)
   Data_Get_Struct(self, png_decoder_t, ptr);
 
   /*
-   * set context
+   * call read header funciton
    */
-  set_read_context(ptr, data);
+  arg.ptr  = ptr;
+  arg.data = data;
 
-  /*
-   * do read header
-   */
-  ret = create_meta(ptr);
-
-  /*
-   * clear context
-   */
-  clear_read_context(ptr);
+  ret = rb_ensure(read_header_body, (VALUE)&arg,
+                  read_header_ensure, (VALUE)ptr);
 
   return ret;
 }
@@ -1063,15 +1221,198 @@ rb_decode_result_meta(VALUE self)
   return rb_ivar_get(self, id_meta);
 }
 
+typedef struct {
+  png_decoder_t* ptr;
+  VALUE data;
+} decode_arg_t;
+
+static VALUE
+decode_simplified_api_body(VALUE _arg)
+{
+  VALUE ret;
+
+  decode_arg_t* arg;
+  png_decoder_t* ptr;
+  VALUE data;
+
+  size_t stride;
+  size_t size;
+
+  /*
+   * initialize
+   */
+  arg  = (decode_arg_t*)_arg;
+  ptr  = arg->ptr;
+  data = arg->data;
+
+  /*
+   * call simplified API
+   */
+  do {
+    ptr->simplified.ctx = (png_imagep)xmalloc(sizeof(png_image));
+    memset(ptr->simplified.ctx, 0, sizeof(png_image));
+
+    ptr->simplified.ctx->version = PNG_IMAGE_VERSION;
+
+    png_image_begin_read_from_memory(ptr->simplified.ctx,
+                                     RSTRING_PTR(data), RSTRING_LEN(data));
+    if (PNG_IMAGE_FAILED(*ptr->simplified.ctx)) {
+      RUNTIME_ERROR("png_image_begin_read_from_memory() failed");
+    }
+
+    ptr->simplified.ctx->format = ptr->common.format;
+
+    stride = PNG_IMAGE_ROW_STRIDE(*ptr->simplified.ctx);
+    size   = PNG_IMAGE_BUFFER_SIZE(*ptr->simplified.ctx, stride);
+    ret    = rb_str_buf_new(size);
+    rb_str_set_len(ret, size);
+
+    png_image_finish_read(ptr->simplified.ctx,
+                          NULL, RSTRING_PTR(ret), stride, NULL);
+    if (PNG_IMAGE_FAILED(*ptr->simplified.ctx)) {
+      RUNTIME_ERROR("png_image_finish_read() failed");
+    }
+
+    if (ptr->common.need_meta) {
+      rb_ivar_set(ret, id_meta, create_tiny_meta(ptr));
+      rb_define_singleton_method(ret, "meta", rb_decode_result_meta, 0);
+    }
+  } while(0);
+
+  return ret;
+}
+
+static VALUE
+decode_simplified_api_ensure(VALUE _arg)
+{
+  png_decoder_t* ptr;
+
+  ptr = (png_decoder_t*)_arg;
+
+  if (ptr->simplified.ctx) {
+    png_image_free(ptr->simplified.ctx);
+    xfree(ptr->simplified.ctx);
+  }
+
+  ptr->simplified.ctx = NULL;
+
+  return Qundef;
+}
+
+static VALUE
+decode_classic_api_body(VALUE _arg)
+{
+  VALUE ret;
+
+  decode_arg_t* arg;
+  png_decoder_t* ptr;
+  VALUE data;
+
+  size_t stride;
+
+  png_uint_32 i;
+  png_byte* p;
+
+  double file_gamma;
+
+  /*
+   * initialize
+   */
+  arg  = (decode_arg_t*)_arg;
+  ptr  = arg->ptr;
+  data = arg->data;
+
+  /*
+   * set context
+   */
+  set_read_context(ptr, data);
+
+  /*
+   * read basic info
+   */
+  png_read_info(ptr->classic.ctx, ptr->classic.fsi);
+
+  /*
+   * gamma correction
+   */
+  if (!isnan(ptr->common.display_gamma)) {
+    if (!png_get_gAMA(ptr->classic.ctx, ptr->classic.fsi, &file_gamma)) {
+      file_gamma = 0.45;
+    }
+
+    png_set_gamma(ptr->classic.ctx, ptr->common.display_gamma, file_gamma);
+  }
+
+  png_read_update_info(ptr->classic.ctx, ptr->classic.fsi);
+
+  /*
+   * get image size
+   */
+
+  ptr->classic.width  = \
+      png_get_image_width(ptr->classic.ctx, ptr->classic.fsi);
+
+  ptr->classic.height = \
+      png_get_image_height(ptr->classic.ctx, ptr->classic.fsi);
+
+  stride = png_get_rowbytes(ptr->classic.ctx, ptr->classic.fsi);
+
+  /*
+   * alloc return memory
+   */
+  ret  = rb_str_buf_new(stride * ptr->classic.height);
+  rb_str_set_len(ret, stride * ptr->classic.height);
+
+  /*
+   * alloc rows
+   */
+  ptr->classic.rows = png_malloc(ptr->classic.ctx,
+                                 ptr->classic.height * sizeof(png_byte*));
+  if (ptr->classic.rows == NULL) {
+    NOMEMORY_ERROR("no memory");
+  }
+
+  p = (png_byte*)RSTRING_PTR(ret);
+  for (i = 0; i < ptr->classic.height; i++) {
+    ptr->classic.rows[i] = p;
+    p += stride;
+  }
+
+  png_read_image(ptr->classic.ctx, ptr->classic.rows);
+  png_read_end(ptr->classic.ctx, ptr->classic.fsi);
+
+  if (ptr->classic.need_meta) {
+    get_header_info(ptr);
+    rb_ivar_set(ret, id_meta, create_meta(ptr));
+    rb_define_singleton_method(ret, "meta", rb_decode_result_meta, 0);
+  }
+
+  return ret;
+}
+
+static VALUE
+decode_classic_api_ensure(VALUE _arg)
+{
+  png_decoder_t* ptr;
+
+  ptr = (png_decoder_t*)_arg;
+
+  if (ptr->classic.rows) {
+    png_free(ptr->classic.ctx, ptr->classic.rows);
+    ptr->classic.rows = NULL;
+  }
+
+  clear_read_context(ptr);
+
+  return Qundef;
+}
+
 static VALUE
 rb_decoder_decode(VALUE self, VALUE data)
 {
-  png_decoder_t* ptr;
-  png_imagep png;
   VALUE ret;
-  size_t stride;
-  size_t size;
-  char* err;
+  png_decoder_t* ptr;
+  decode_arg_t arg;
 
   /*
    * argument check
@@ -1084,46 +1425,18 @@ rb_decoder_decode(VALUE self, VALUE data)
   Data_Get_Struct(self, png_decoder_t, ptr);
 
   /*
-   * Call libpng Simplified API
+   * call decode funcs
    */
-  do {
-    err = NULL;
+  arg.ptr  = ptr;
+  arg.data = data;
 
-    png = (png_imagep)xmalloc(sizeof(png_image));
-    memset(png, 0, sizeof(png_image));
+  if (ptr->common.api_type == API_SIMPLIFIED) {
+    ret = rb_ensure(decode_simplified_api_body, (VALUE)&arg,
+                    decode_simplified_api_ensure, (VALUE)ptr);
 
-    png->version = PNG_IMAGE_VERSION;
-
-    png_image_begin_read_from_memory(png, RSTRING_PTR(data), RSTRING_LEN(data));
-    if (PNG_IMAGE_FAILED(*png)) {
-      err = "png_image_begin_read_from_memory() failed.";
-      break;
-    }
-
-    png->format = ptr->format;
-
-    stride = PNG_IMAGE_ROW_STRIDE(*png);
-    size   = PNG_IMAGE_BUFFER_SIZE(*png, stride);
-    ret    = rb_str_buf_new(size);
-    rb_str_set_len(ret, size);
-
-    png_image_finish_read(png, NULL, RSTRING_PTR(ret), stride, NULL);
-    if (PNG_IMAGE_FAILED(*png)) {
-      err = "png_image_finish_read() failed.";
-      break;
-    }
-
-    if (ptr->need_meta) {
-      rb_ivar_set(ret, id_meta, create_tiny_meta(png));
-      rb_define_singleton_method(ret, "meta", rb_decode_result_meta, 0);
-    }
-  } while(0);
-
-  png_image_free(png);
-  xfree(png);
-
-  if (err != NULL) {
-    RUNTIME_ERROR(err);
+  } else {
+    ret = rb_ensure(decode_classic_api_body, (VALUE)&arg,
+                    decode_classic_api_ensure, (VALUE)ptr);
   }
 
   return ret;
@@ -1161,10 +1474,12 @@ Init_png()
   rb_define_attr(meta_klass, "color_type", 1, 0);
   rb_define_attr(meta_klass, "interlace_method", 1, 0);
   rb_define_attr(meta_klass, "compression_method", 1, 0);
-  rb_define_attr(meta_klass, "fileter_method", 1, 0);
+  rb_define_attr(meta_klass, "filter_method", 1, 0);
+  rb_define_attr(meta_klass, "pixel_format", 1, 0);
   rb_define_attr(meta_klass, "num_components", 1, 0);
   rb_define_attr(meta_klass, "text", 1, 0);
   rb_define_attr(meta_klass, "time", 1, 0);
+  rb_define_attr(meta_klass, "file_gamma", 1, 0);
 
   for (i = 0; i < (int)N(encoder_opt_keys); i++) {
     encoder_opt_ids[i] = rb_intern_const(encoder_opt_keys[i]);
@@ -1177,5 +1492,6 @@ Init_png()
   id_meta    = rb_intern_const("@meta");
   id_stride  = rb_intern_const("@stride");
   id_format  = rb_intern_const("@format");
+  id_pixfmt  = rb_intern_const("@pixel_format");
   id_ncompo  = rb_intern_const("@num_components");
 }

@@ -113,7 +113,7 @@ class TestSimple < Test::Unit::TestCase
 
     assert_equal(256, met.width)
     assert_equal(224, met.height)
-    assert_equal("RGB", met.color_type)
+    assert_equal("RGB", met.pixel_format)
     assert_equal(768, met.stride)
     assert_equal(met.stride * met.height, img.bytesize)
   end

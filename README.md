@@ -35,9 +35,10 @@ IO.binwrite("test.bgr", raw)
 #### decode options
 | option | value type | description |
 |---|---|---|
-| :color_type   | String or Symbol | output format |
-| :pixel_format | String or Symbol | alias of :color_type |
+| :api_type     | "simplified" or "classic" | |
+| :pixel_format | String or Symbol | output format<br>(ignored when to use classic API) |
 | :without_meta | Boolean | T.B.D |
+| :display_gamma | Numeric | T.B.D<br>(ignored when to use simplified API) |
 
 #### supported output color type
 GRAY GRAYSCALE GA AG RGB BGR RGBA ARGB BGRA ABGR
@@ -54,12 +55,12 @@ IO.binwrite("test.png", enc << IO.binread("test.raw"))
 #### encode options
 | option | value type | description |
 |---|---|---|
-| :color_type   | String or Symbol | input format |
-| :pixel_fromat | String or Symbol | alias of :color_type |
+| :pixel_fromat | String or Symbol | input pixel format |
 | :interlace    | Boolean          | use interlace mode |
 | :compression  | Integer or String or Symbol | compression level |
 | :text         | Hash             | text information |
 | :time         | Boolean          | with tIME chunk |
+| :gamma        | Numeric          | file gamma value |
 
 #### supported input color type
 GRAY GRASCALE GA RGB RGBA
