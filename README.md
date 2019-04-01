@@ -15,6 +15,10 @@ Or install it yourself as:
 
     $ gem install libpng-ruby
 
+If you need to specify the libpng path, use the following options:
+
+    $ gem install libpng-ruby -- --with-png-include ~/env/opts/include --with-png-lib ~/env/opts/lib
+
 ## Usage
 
 ### decode sample
