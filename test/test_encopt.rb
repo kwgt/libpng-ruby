@@ -230,13 +230,13 @@ class TestEncodeOption < Test::Unit::TestCase
 
   data("true", [true, TypeError])
   data("false", [false, TypeError])
-  data("string", ["true", ArgumentError])
+  data("string", ["true", TypeError])
   data("hash", [{}, TypeError])
   data("array", [[], TypeError])
 
-  test "bad :gamma" do |val|
+  test "bad :gamma" do |arg|
     assert_raise_kind_of(arg[1]) {
-      PNG::Encoder.new(128, 133, :gamma => val)
+      PNG::Encoder.new(128, 133, :gamma => arg[0])
     }
   end
 end

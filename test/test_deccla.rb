@@ -16,7 +16,7 @@ class TestDecodeClassicAPI < Test::Unit::TestCase
 
   test "simple decode" do |arg|
     dec = assert_nothing_raised {
-      PNG::Decoder.new(:api_type => :classic, :gamma => 1.0)
+      PNG::Decoder.new(:api_type => :classic, :display_gamma => 1.0)
     }
 
     raw = assert_nothing_raised {
