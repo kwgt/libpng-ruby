@@ -59,7 +59,7 @@ IO.binwrite("test.png", enc << IO.binread("test.raw"))
 #### encode options
 | option | value type | description |
 |---|---|---|
-| :pixel_fromat | String or Symbol | input pixel format |
+| :pixel_format | String or Symbol | input pixel format |
 | :interlace    | Boolean          | use interlace mode |
 | :compression  | Integer or String or Symbol | compression level |
 | :text         | Hash             | text information |
