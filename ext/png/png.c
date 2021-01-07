@@ -19,6 +19,7 @@
 #include <zlib.h>
 
 #include "ruby.h"
+#include "ruby/version.h"
 
 #define N(x)                        (sizeof(x)/sizeof(*x))
 
@@ -74,6 +75,9 @@ typedef struct {
 
   png_text* text;
   int num_text;
+
+  VALUE ibuf;
+  VALUE obuf;
 
   double gamma;
 } png_encoder_t;
@@ -157,6 +161,21 @@ static const char* encoder_opt_keys[] ={
 
 static ID encoder_opt_ids[N(encoder_opt_keys)];
 
+static void
+rb_encoder_mark(void* _ptr)
+{
+  png_encoder_t* ptr;
+
+  ptr = (png_encoder_t*)_ptr;
+
+  if (ptr->ibuf != Qnil) {
+    rb_gc_mark(ptr->ibuf);
+  }
+
+  if (ptr->obuf != Qnil) {
+    rb_gc_mark(ptr->obuf);
+  }
+}
 
 static void
 rb_encoder_free(void* _ptr)
@@ -187,6 +206,71 @@ rb_encoder_free(void* _ptr)
   }
 
   free(ptr);
+}
+
+static size_t
+rb_encoder_size(const void* _ptr)
+{
+  size_t ret;
+  png_encoder_t* ptr;
+  int i;
+
+  ptr = (png_encoder_t*)_ptr;
+
+  ret  = sizeof(png_encoder_t);
+  // ret += sizeof(png_struct);
+  // ret += sizeof(png_info);
+  ret += (sizeof(png_byte*) * ptr->width);
+
+  ret += sizeof(png_text) * ptr->num_text;
+
+  for (i = 0; i < ptr->num_text; i++) {
+    ret += (strlen(ptr->text[i].key) + ptr->text[i].text_length);
+  }
+
+  return ret;
+}
+
+#if RUBY_API_VERSION_CODE > 20600
+static const rb_data_type_t png_encoder_data_type = {
+  "libpng-ruby encoder object",     // wrap_struct_name
+  {
+    rb_encoder_mark,                 // function.dmark
+    rb_encoder_free,                 // function.dfree
+    rb_encoder_size,                 // function.dsize
+    NULL,                            // function.dcompact
+    {NULL},                          // function.reserved
+  },
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#else /* RUBY_API_VERSION_CODE > 20600 */
+static const rb_data_type_t png_encoder_data_type = {
+  "libpng-ruby encoder object",     // wrap_struct_name
+  {
+    rb_encoder_mark,                 // function.dmark
+    rb_encoder_free,                 // function.dfree
+    rb_encoder_size,                 // function.dsize
+    {NULL, NULL},                    // function.reserved
+  },
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#endif /* RUBY_API_VERSION_CODE > 20600 */
+
+static VALUE
+create_runtime_error(const char* fmt, ...)
+{
+  VALUE ret;
+  va_list ap;
+
+  va_start(ap, fmt);
+  ret = rb_exc_new_str(rb_eRuntimeError, rb_vsprintf(fmt, ap));
+  va_end(ap);
+
+  return ret;
 }
 
 static void
@@ -220,7 +304,7 @@ rb_encoder_alloc(VALUE self)
   ptr->with_time = !0;
   ptr->gamma     = NAN;
 
-  return Data_Wrap_Struct(encoder_klass, 0, rb_encoder_free, ptr);
+  return TypedData_Wrap_Struct(encoder_klass, &png_encoder_data_type, ptr);
 }
 
 static void
@@ -463,7 +547,8 @@ set_encoder_context(png_encoder_t* ptr, int wd, int ht, VALUE opt)
     ptr->stride = ptr->width * ptr->num_comp;
     ptr->pixels = ptr->stride * ptr->height;
     ptr->rows   = rows;
-
+    ptr->ibuf   = Qnil;
+    ptr->obuf   = Qnil;
   } while(0);
 
   /*
@@ -491,7 +576,7 @@ rb_encoder_initialize(int argc, VALUE* argv, VALUE self)
   /*
    * strip object
    */
-  Data_Get_Struct(self, png_encoder_t, ptr);
+  TypedData_Get_Struct(self, png_encoder_t, &png_encoder_data_type, ptr);
 
   /*
    * parse argument
@@ -515,6 +600,7 @@ static VALUE
 rb_encoder_encode(VALUE self, VALUE data)
 {
   VALUE ret;
+  VALUE exc;
   png_encoder_t* ptr;
   png_uint_32 i;
   uint8_t* p;
@@ -523,11 +609,12 @@ rb_encoder_encode(VALUE self, VALUE data)
    * initialize
    */
   ret = rb_str_buf_new(0);
+  exc = Qnil;
 
   /*
    * strip object
    */
-  Data_Get_Struct(self, png_encoder_t, ptr);
+  TypedData_Get_Struct(self, png_encoder_t, &png_encoder_data_type, ptr);
 
   /*
    * argument check
@@ -536,6 +623,13 @@ rb_encoder_encode(VALUE self, VALUE data)
   if (RSTRING_LEN(data) != ptr->pixels) {
     ARGUMENT_ERROR("invalid data size");
   }
+
+
+  /*
+   * prepare
+   */
+  ptr->ibuf = data;
+  ptr->obuf = ret;
 
   /*
    * call libpng
@@ -583,11 +677,19 @@ rb_encoder_encode(VALUE self, VALUE data)
   png_set_rows(ptr->ctx, ptr->info, ptr->rows);
 
   if (setjmp(png_jmpbuf(ptr->ctx))) {
-    RUNTIME_ERROR("encode error");
+    exc = create_runtime_error("encode error");
 
   } else {
     png_write_png(ptr->ctx, ptr->info, PNG_TRANSFORM_IDENTITY, NULL);
   }
+
+  /*
+   * post process
+   */
+  ptr->ibuf = Qnil;
+  ptr->obuf = Qnil;
+  
+  if (RTEST(exc)) rb_exc_raise(exc);
 
   return ret;
 }
@@ -608,6 +710,11 @@ mem_io_read_data(png_structp ctx, png_bytep dst, png_size_t rq_size)
   }
 }
 
+static void
+rb_decoder_mark(void* _ptr)
+{
+  // nothing
+}
 
 static void
 rb_decoder_free(void* _ptr)
@@ -637,6 +744,45 @@ rb_decoder_free(void* _ptr)
   free(ptr);
 }
 
+static size_t
+rb_decoder_size(const void* _ptr)
+{
+  size_t ret;
+
+  ret = sizeof(png_decoder_t);
+
+  return ret;
+}
+
+#if RUBY_API_VERSION_CODE > 20600
+static const rb_data_type_t png_decoder_data_type = {
+  "libpng-ruby decoder object",      // wrap_struct_name
+  {
+    rb_decoder_mark,                 // function.dmark
+    rb_decoder_free,                 // function.dfree
+    rb_decoder_size,                 // function.dsize
+    NULL,                            // function.dcompact
+    {NULL},                          // function.reserved
+  },
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#else /* RUBY_API_VERSION_CODE > 20600 */
+static const rb_data_type_t png_decoder_data_type = {
+  "libpng-ruby decoder object",      // wrap_struct_name
+  {
+    rb_decoder_mark,                 // function.dmark
+    rb_decoder_free,                 // function.dfree
+    rb_decoder_size,                 // function.dsize
+    {NULL, NULL},                    // function.reserved
+  },
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#endif /* RUBY_API_VERSION_CODE > 20600 */
+
 static VALUE
 rb_decoder_alloc(VALUE self)
 {
@@ -650,7 +796,7 @@ rb_decoder_alloc(VALUE self)
   ptr->common.need_meta     = !0;
   ptr->common.display_gamma = NAN;
 
-  return Data_Wrap_Struct(decoder_klass, 0, rb_decoder_free, ptr);
+  return TypedData_Wrap_Struct(decoder_klass, &png_decoder_data_type, ptr);
 }
 
 static void
@@ -758,7 +904,7 @@ rb_decoder_initialize(int argc, VALUE* argv, VALUE self)
   /*
    * strip object
    */
-  Data_Get_Struct(self, png_decoder_t, ptr);
+  TypedData_Get_Struct(self, png_decoder_t, &png_decoder_data_type, ptr);
 
   /*
    * parse argument
@@ -1201,7 +1347,7 @@ rb_decoder_read_header(VALUE self, VALUE data)
   /*
    * strip object
    */
-  Data_Get_Struct(self, png_decoder_t, ptr);
+  TypedData_Get_Struct(self, png_decoder_t, &png_decoder_data_type, ptr);
 
   /*
    * call read header funciton
@@ -1422,7 +1568,7 @@ rb_decoder_decode(VALUE self, VALUE data)
   /*
    * strip object
    */
-  Data_Get_Struct(self, png_decoder_t, ptr);
+  TypedData_Get_Struct(self, png_decoder_t, &png_decoder_data_type, ptr);
 
   /*
    * call decode funcs
