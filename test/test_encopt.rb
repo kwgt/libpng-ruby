@@ -117,8 +117,8 @@ class TestEncodeOption < Test::Unit::TestCase
     end
   end
 
-  data("-1", [-1, ArgumentError])
-  data("10", [10, ArgumentError])
+  data("-1", [-1, RangeError])
+  data("10", [10, RangeError])
   data("true", [true, TypeError])
   data("false", [false, TypeError])
   data("string", ["true", ArgumentError])
@@ -153,18 +153,16 @@ class TestEncodeOption < Test::Unit::TestCase
     assert_equal(val, PNG::Decoder.new.read_header(png).text)
   end
 
-  data("-1", [-1, ArgumentError])
-  data("10", [10, ArgumentError])
-  data("true", [true, TypeError])
-  data("false", [false, TypeError])
-  data("string", ["true", ArgumentError])
-  data("hash", [{}, TypeError])
-  data("array", [[], TypeError])
-
+  data("-1",     [-1,     TypeError])
+  data("10",     [10,     TypeError])
+  data("true",   [true,   TypeError])
+  data("false",  [false,  TypeError])
+  data("string", ["true", TypeError])
+  data("array",  [[],     TypeError])
 
   test "bad :text" do |arg|
     assert_raise_kind_of(arg[1]) {
-      PNG::Encoder.new(128, 133, :compression => arg[0])
+      PNG::Encoder.new(128, 133, :text => arg[0])
     }
   end
 

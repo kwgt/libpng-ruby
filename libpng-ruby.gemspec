@@ -27,7 +27,7 @@ Gem::Specification.new do |spec|
     }
   end
 
-  spec.bindir        = "bin"
+  spec.bindir        = "exe"
   spec.executables   = spec.files.grep(%r{^bin/}) { |f| File.basename(f) }
   spec.extensions    = ["ext/png/extconf.rb"]
   spec.require_paths = ["lib"]
