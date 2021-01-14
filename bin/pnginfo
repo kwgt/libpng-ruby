@@ -1,7 +1,0 @@
-#! /usr/bin/env ruby
-# coding: utf-8
-
-require 'png'
-
-ARGF.binmode
-pp PNG.read_header(ARGF.read)

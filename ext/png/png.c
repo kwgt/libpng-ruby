@@ -459,8 +459,8 @@ eval_encoder_opt_pixel_format(png_encoder_t* ptr, VALUE opt)
 
   switch (TYPE(opt)) {
   case T_UNDEF:
-    ptr->c_type   = PNG_COLOR_TYPE_RGB;
-    ptr->num_comp = 3;
+    type = PNG_COLOR_TYPE_RGB;
+    comp = 3;
     break;
 
   case T_STRING:
