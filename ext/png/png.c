@@ -4,6 +4,10 @@
  *  Copyright (C) 2016 Hiroshi Kuwagata <kgt9221@gmail.com>
  */
 
+#ifdef __GNUC__
+#pragma GCC diagnostic ignored "-Wsuggest-attribute=format"
+#endif /* defined(__GNUC__) */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -1516,7 +1520,7 @@ get_color_type_str(png_decoder_t* ptr)
     break;
   }
 
-  return rb_str_new_cstr(cstr);
+  return rb_str_freeze(rb_str_new_cstr(cstr));
 }
 
 static VALUE
@@ -1540,7 +1544,7 @@ get_interlace_method_str(png_decoder_t* ptr)
     break;
   }
 
-  return rb_str_new_cstr(cstr);
+  return rb_str_freeze(rb_str_new_cstr(cstr));
 }
 
 static VALUE
@@ -1560,7 +1564,7 @@ get_compression_method_str(png_decoder_t* ptr)
     break;
   }
 
-  return rb_str_new_cstr(cstr);
+  return rb_str_freeze(rb_str_new_cstr(cstr));
 }
 
 static VALUE
@@ -1584,7 +1588,7 @@ get_filter_method_str(png_decoder_t* ptr)
     break;
   }
 
-  return rb_str_new_cstr(cstr);
+  return rb_str_freeze(rb_str_new_cstr(cstr));
 }
 
 static VALUE
@@ -1603,11 +1607,16 @@ create_text_meta(png_decoder_t* ptr)
     val = rb_str_new(ptr->classic.text[i].text,
                      ptr->classic.text[i].text_length);
 
+    rb_str_freeze(key);
+    rb_str_freeze(val);
+
     rb_funcall(key, rb_intern("downcase!"), 0);
     rb_funcall(key, rb_intern("gsub!"), 2, rb_str_new2(" "), rb_str_new2("_"));
 
     rb_hash_aset(ret, rb_to_symbol(key), val);
   }
+
+  rb_obj_freeze(ret);
 
   return ret;
 }
@@ -1628,6 +1637,8 @@ create_time_meta(png_decoder_t* ptr)
                    INT2FIX(ptr->classic.time->second));
 
   rb_funcall(ret, rb_intern("localtime"), 0);
+
+  rb_obj_freeze(ret);
 
   return ret;
 }
@@ -1665,6 +1676,8 @@ create_meta(png_decoder_t* ptr)
                 rb_intern("@file_gamma"),
                 DBL2NUM(ptr->classic.file_gamma));
   }
+
+  rb_obj_freeze(ret);
 
   return ret;
 }
@@ -1739,8 +1752,10 @@ create_tiny_meta(png_decoder_t* ptr)
     break;
   }
 
-  rb_ivar_set(ret, id_pixfmt, rb_str_new_cstr(fmt));
+  rb_ivar_set(ret, id_pixfmt, rb_str_freeze(rb_str_new_cstr(fmt)));
   rb_ivar_set(ret, id_ncompo, INT2FIX(nc));
+
+  rb_obj_freeze(ret);
 
   return ret;
 }
@@ -2091,6 +2106,10 @@ void
 Init_png()
 {
   int i;
+
+#ifdef HAVE_RB_EXT_RACTOR_SAFE
+  rb_ext_ractor_safe(true);
+#endif /* defined(HAVE_RB_EXT_RACTOR_SAFE) */
 
   module = rb_define_module("PNG");
 
