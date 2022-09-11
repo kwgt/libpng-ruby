@@ -26,7 +26,7 @@ If you need to specify the libpng path, use the following options:
 ```ruby
 require 'png'
 
-dec = PNG::Decoder.new(:color_type => :BGR)
+dec = PNG::Decoder.new(:pixel_format => :BGR)
 
 p dec.read_header(IO.binread("test.png"))
 
